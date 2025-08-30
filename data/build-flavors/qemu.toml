@@ -1,0 +1,17 @@
+image_format = ["qcow2"]
+
+packages = [
+  "curl",
+  "dnsutils",
+  "ethtool",
+  "htop",
+  "iperf3",
+  "jq",
+  "lm-sensors",
+  "lsof",
+  "mtr-tiny",
+  "qemu-guest-agent",
+  "rng-tools",
+  "strace",
+  "vim",
+]
