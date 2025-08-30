@@ -1,0 +1,272 @@
+name: Image Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      extra_packages:
+        description: "Packages to bake into the image (space-separated list)"
+        type: string
+        required: false
+      builder_flavor:
+        description: Flavor to build
+        type: choice
+        options: [generic, qemu]
+        default: qemu
+      builder_architecture:
+        description: "Target architecture"
+        type: choice
+        options: [amd64, arm64]
+        default: amd64
+      builder_disk_size:
+        description: "Disk size (GB) for non-ISO flavors"
+        type: number
+        default: 6
+      builder_build_type:
+        description: Build type
+        type: choice
+        options: [release, development]
+        default: release
+      builder_mirrors:
+        description: >
+          JSON: {"debian":{"main":"","security":"","pbuilder":""},"vyos":""}
+        type: string
+        required: false
+        default: ""
+      builder_opts:
+        description: >
+          JSON: {"hooks":"","bootloaders":""}
+        type: string
+        required: false
+        default: ""
+      debug:
+        description: Enable debug
+        type: boolean
+        default: false
+      dry_run:
+        description: Dry run (validate and exit)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-builder-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILDER_FLAVOR: ${{ inputs.builder_flavor }}
+  EXTRA_PACKAGES: ${{ inputs.extra_packages }}
+  BUILDER_ARCHITECTURE: ${{ inputs.builder_architecture }}
+  BUILDER_DISK_SIZE: ${{ inputs.builder_disk_size }}
+  BUILDER_BUILD_TYPE: ${{ inputs.builder_build_type }}
+  BUILDER_MIRRORS: ${{ inputs.builder_mirrors }}
+  BUILDER_OPTS: ${{ inputs.builder_opts }}
+  DEBUG_FLAG: ${{ inputs.debug }}
+  DRY_RUN_FLAG: ${{ inputs.dry_run }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      author: ${{ steps.author.outputs.identity }}
+      mirrors_json: ${{ steps.check_config.outputs.mirrors_json }}
+      opts_json: ${{ steps.check_config.outputs.opts_json}}
+      timestamp: ${{ steps.timestamp.outputs.date }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Fetch author
+        id: author
+        run: |
+          set -euo pipefail
+          AUTHOR="$(git log -1 --format='%an <%ae>' 2>/dev/null || true)"
+          if [[ -z "$AUTHOR" || "$AUTHOR" == *"<>"* ]]; then
+            AUTHOR="${GITHUB_ACTOR} <${GITHUB_ACTOR}@users.noreply.github.com>"
+          fi
+
+          echo "identity=$AUTHOR" >> "$GITHUB_OUTPUT"
+
+      - name: Check config
+        id: check_config
+        run: |
+          MIRRORS="${BUILDER_MIRRORS:-}"
+          OPTS="${BUILDER_OPTS:-}"
+
+          # Validate JSON
+          [ -n "$MIRRORS" ] && echo "$MIRRORS" | jq -e . > /dev/null || true
+          [ -n "$OPTS" ] && echo "$OPTS" | jq -e . > /dev/null || true
+
+          {
+            echo "mirrors_json=$MIRRORS"
+            echo "opts_json=$OPTS"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate timestamp
+        id: timestamp
+        env:
+          TZ: Europe/Paris
+        run: echo "date=$(date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container:
+      image: vyos/vyos-build:current
+      options: --privileged
+      env:
+        AUTHOR: ${{ needs.prepare.outputs.author }}
+        MIRRORS: ${{ needs.prepare.outputs.mirrors_json }}
+        OPTS: ${{ needs.prepare.outputs.opts_json }}
+        BUILD_DATE: ${{ needs.prepare.outputs.timestamp }}
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+        shell: bash
+    needs: prepare
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Compile config
+        id: config
+        run: |
+          set -e
+          get() { jq -r --arg p "$1" 'try (getpath($p|split(".")) // empty)' <<<"$2"; }
+
+          DEB_MAIN="$(get 'debian.main'     "$MIRRORS")"
+          DEB_SEC="$(get 'debian.security'  "$MIRRORS")"
+          DEB_PB="$(get 'debian.pbuilder'   "$MIRRORS")"
+          VYOS_MIRROR="$(get 'vyos'         "$MIRRORS")"
+          HOOKS="$(get 'hooks'              "$OPTS")"
+          BOOTLOADERS="$(get 'bootloaders'  "$OPTS")"
+
+          {
+            echo "deb_main=$DEB_MAIN"
+            echo "deb_sec=$DEB_SEC"
+            echo "deb_pbuilder=$DEB_PB"
+            echo "vyos_mirror=$VYOS_MIRROR"
+            echo "hooks=$HOOKS"
+            echo "bootloaders=$BOOTLOADERS"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fetch extra packages
+        if: ${{ env.BUILDER_FLAVOR != 'proxmox' && env.EXTRA_PACKAGES != '' }}
+        working-directory: packages
+        run: |
+          echo "📦 Extra packages:\t${EXTRA_PACKAGES}"
+          echo "⏬ Fetching extra packages"
+          for p in ${EXTRA_PACKAGES}; do
+            apt-get download "${p}";
+          done
+
+      - name: Build image
+        env:
+          BOOTLOADERS: ${{ steps.config.outputs.bootloaders }}
+          BUILD_DATE: ${{ needs.prepare.outputs.timestamp }}
+          DEB_MAIN: ${{ steps.config.outputs.deb_main }}
+          DEB_PBUILDER: ${{ steps.config.outputs.deb_pbuilder }}
+          DEB_SEC: ${{ steps.config.outputs.deb_sec }}
+          HOOKS: ${{ steps.config.outputs.hooks }}
+          VYOS_MIRROR: ${{ steps.config.outputs.vyos_mirror }}
+        run: |
+          VERSION="${GITHUB_SHA:0:8}-${BUILD_DATE//-/}"
+
+          cat <<EOF
+          🪵 Builder settings
+            Image:
+              Arch:     ${BUILDER_ARCHITECTURE}
+              Channel:  ${BUILDER_BUILD_TYPE}
+              Flavor:   ${BUILDER_FLAVOR}
+              Version:  ${VERSION}
+
+            Mirrors:
+              Debian main:  ${DEB_MAIN:-<none>}
+              Debian sec:   ${DEB_SEC:-<none>}
+              Debian pb:    ${DEB_PBUILDER:-<none>}
+              VyOS:         ${VYOS_MIRROR:-<none>}
+            Author:   ${AUTHOR:-<unknown>}
+
+          EOF
+
+          CMD=( ./build-vyos-image
+            --architecture "${BUILDER_ARCHITECTURE}"
+            --build-type "${BUILDER_BUILD_TYPE}"
+            --version "${VERSION}"
+          )
+
+          [[ -n "${BUILDER_DISK_SIZE:-}" ]] && CMD+=( --disk-size "${BUILDER_DISK_SIZE}" )
+          [[ -n "${AUTHOR:-}"            ]] && CMD+=( --build-by "${AUTHOR}" )
+          [[ -n "${DEB_MAIN:-}"          ]] && CMD+=( --debian-mirror "${DEB_MAIN}" )
+          [[ -n "${DEB_SEC:-}"           ]] && CMD+=( --debian-security-mirror "${DEB_SEC}" )
+          [[ -n "${DEB_PBUILDER:-}"      ]] && CMD+=( --pbuilder-debian-mirror "${DEB_PBUILDER}" )
+          [[ -n "${VYOS_MIRROR:-}"       ]] && CMD+=( --vyos-mirror "${VYOS_MIRROR}" )
+          [[ -n "${HOOKS:-}"             ]] && CMD+=( --hooks-opts "${HOOKS}" )
+          [[ -n "${BOOTLOADERS:-}"       ]] && CMD+=( --bootloaders "${BOOTLOADERS}" )
+
+          [[ "${DEBUG_FLAG:-false}" == "true" ]] && CMD+=( --debug )
+          [[ "${DRY_RUN_FLAG:-false}" == "true" ]] && CMD+=( --dry-run )
+
+          CMD+=( "${BUILDER_FLAVOR}" )
+
+          if command -v sudo >/dev/null 2>&1; then
+            sudo "${CMD[@]}"
+          else
+            "${CMD[@]}"
+          fi
+
+      - name: Cache images
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUILDER_FLAVOR }}-${{ github.run_id }}
+          path: |
+            build/**/*.qcow2
+            build/**/*.iso
+          if-no-files-found: error
+          retention-days: 7
+
+  upload:
+    runs-on: ubuntu-24.04
+    needs: [prepare, build]
+    env:
+      B2_APPLICATION_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      B2_APPLICATION_KEY: ${{ secrets.B2_APP_KEY }}
+      B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+      BUILD_FLAVOR: ${{ inputs.builder_flavor }}
+    steps:
+      - name: Compute metadata
+        id: metadata
+        run: echo "build_id=${BUILD_FLAVOR}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Install B2's CLI
+        uses: sylwit/install-b2-cli-action@v1.1.0
+        with:
+          version: "4.4.1"
+
+      - name: Set B2_ACCOUNT_INFO
+        run: echo "B2_ACCOUNT_INFO=$RUNNER_TEMP/b2_account.sqlite" >> "$GITHUB_ENV"
+
+      - name: Authorize B2
+        run: b2 account authorize
+
+      - name: Fetch cached images
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.metadata.outputs.build_id }}
+          path: build
+
+      - name: Upload ISO
+        if: ${{ env.BUILD_FLAVOR == 'generic' }}
+        run: |
+          b2 sync --threads 16 --no-progress \
+            --exclude-regex '.*' \
+            --include-regex '[^/]+\.iso$' \
+            build "b2://${B2_BUCKET_NAME}/"
+
+      - name: Upload QCOW2
+        if: ${{ env.BUILD_FLAVOR == 'qemu' }}
+        run: |
+          b2 sync --threads 16 --no-progress \
+            --exclude-regex '.*' \
+            --include-regex '[^/]+\.qcow2$' \
+            build "b2://${B2_BUCKET_NAME}/"
