@@ -243,11 +243,10 @@ jobs:
         with:
           version: "4.4.1"
 
-      - name: Set B2_ACCOUNT_INFO
-        run: echo "B2_ACCOUNT_INFO=$RUNNER_TEMP/b2_account.sqlite" >> "$GITHUB_ENV"
-
       - name: Authorize B2
-        run: b2 account authorize
+        run: |
+          echo "B2_ACCOUNT_INFO=$RUNNER_TEMP/b2_account.sqlite" >> "$GITHUB_ENV"
+          b2 account authorize
 
       - name: Fetch cached images
         uses: actions/download-artifact@v4
