@@ -1,6 +1,9 @@
 image_format = ["qcow2"]
 
+kernel_cmdline = ["console=tty0", "console=ttyS0,115200n8"]
+
 packages = [
+  "cloud-init",
   "curl",
   "dnsutils",
   "ethtool",
